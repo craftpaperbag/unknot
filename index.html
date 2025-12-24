@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>unknot - 絡まりをほぐす対話ツール</title>
+
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#f0f9ff',
+                            100: '#e0f2fe',
+                            500: '#0ea5e9',
+                            600: '#0284c7',
+                            700: '#0369a1',
+                            900: '#0c4a6e',
+                        },
+                        ui: {
+                            bg: '#f8fafc',
+                            panel: '#ffffff',
+                            border: '#e2e8f0',
+                            text: '#334155',
+                        }
+                    },
+                    fontSize: {
+                        '3xs': '0.6rem',
+                        '2xs': '0.65rem',
+                        'xs': '0.75rem',
+                        'sm': '0.8rem',
+                        'base': '0.9rem',
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        ::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 2px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        .markdown-body p {
+            margin-bottom: 0.5em;
+        }
+
+        .markdown-body ul {
+            list-style-type: disc;
+            margin-left: 1.5em;
+        }
+
+        .blur-loading {
+            filter: blur(1px);
+            pointer-events: none;
+            transition: filter 0.3s ease;
+        }
+
+        /* Fade in animation for new system message */
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(5px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .msg-fade-in {
+            animation: fadeIn 0.5s ease-out forwards;
+        }
+    </style>
+</head>
+
+<body class="bg-ui-bg text-ui-text font-sans h-screen overflow-hidden flex flex-col">
+
+    <div id="root" class="h-full flex flex-col"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- 1. Constants & Initial State ---
+
+        const INITIAL_TREE = {
+            id: 'root',
+            title: '困りごとの概要',
+            detail: 'ここに対話の出発点となる困りごとが入力されます',
+            isHypothesis: false,
+            children: []
+        };
+
+        const DEFAULT_CONFIG = {
+            provider: 'gemini',
+            apiKey: '',
+            model: 'gemini-1.5-flash',
+            systemRole: 'ベテランの行政相談員',
+            targetGoal: '行政サービス'
+        };
+
+        const LEVEL_STYLES = [
+            { icon: 'fa-comment-dots', color: 'bg-slate-100 text-slate-500 border-slate-200' },
+            { icon: 'fa-sitemap', color: 'bg-slate-100 text-slate-500 border-slate-200' },
+            { icon: 'fa-magnifying-glass', color: 'bg-slate-100 text-slate-500 border-slate-200' },
+            { icon: 'fa-stethoscope', color: 'bg-slate-100 text-slate-500 border-slate-200' },
+            { icon: 'fa-flag-checkered', color: 'bg-brand-600 text-white border-brand-700' }
+        ];
+
+        // --- 2. Prompt Generators ---
+
+        const getAgentASystemPrompt = (role, goal) => `
+あなたは「${role}」です。ユーザーの漠然とした悩みを聞き出し、原因を特定するためのヒアリングを行ってください。
+- 口調：親身で穏やか、かつ簡潔に（100文字程度）。
+- 目的：相手の話を深掘りし、最終的な案内先である「${goal}」に繋げるための情報を整理すること。
+- 決して一度に多くの質問をせず、会話のキャッチボールを重視してください。
+`;
+
+        const getAgentBSystemPrompt = (role, goal) => `
+あなたは「問題解決ツリー」を作成するバックエンドAIです。
+ユーザーと「${role}」の会話、および現在のツリーを入力として受け取り、JSONのみを出力してください。
+
+# タイトル生成ルール
+1. 抽象的な言葉（場所、時間、原因）は禁止。**具体的な事実**（例：換気扇の油汚れ、深夜の騒音）をタイトルにすること。
+2. **Level 5（最終段）は、具体的な「${goal}」の名称**にすること。
+   - 悪い例：「支援制度」「解決策」
+   - 良い例：「児童手当」「一時預かり事業」「配管清掃業者」
+
+# ツリー構造
+Level 1: 困りごと
+Level 2: 要素分解
+Level 3: 詳細事実
+Level 4: 根本原因
+Level 5: 具体的な${goal}（名称）
+
+# データ構造
+{
+  "id": "uuid",
+  "title": "具体的で短い見出し",
+  "detail": "20文字程度の補足",
+  "isHypothesis": boolean,
+  "children": [ ... ]
+}
+`;
+
+        // --- 3. API & Utils ---
+
+        const generateUUID = () => Math.random().toString(36).substr(2, 9);
+
+        // 再帰的にLevel 5ノードの数をカウント
+        const countGoalNodes = (node, level = 0) => {
+            let count = level === 4 ? 1 : 0; // Level 4 index = Step 5
+            if (node.children) {
+                node.children.forEach(c => count += countGoalNodes(c, level + 1));
+            }
+            return count;
+        };
+
+        async function callAiApi(config, systemPrompt, messages, jsonMode = false) {
+            const isGemini = config.provider === 'gemini';
+            const safeModel = config.model.trim();
+
+            if (isGemini) {
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${safeModel}:generateContent?key=${config.apiKey.trim()}`;
+                const contents = [
+                    { role: 'user', parts: [{ text: `System Instruction: ${systemPrompt}` }] },
+                    ...messages.map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.content }] }))
+                ];
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents,
+                        generationConfig: { temperature: 0.7, responseMimeType: jsonMode ? "application/json" : "text/plain" }
+                    })
+                });
+                if (!response.ok) throw new Error(`Gemini Error: ${response.status}`);
+                const data = await response.json();
+                return data.candidates[0].content.parts[0].text;
+            } else {
+                // Ollama
+                const url = 'http://localhost:11434/api/chat';
+                const payloadMessages = [{ role: 'system', content: systemPrompt }, ...messages];
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: safeModel, messages: payloadMessages, stream: false, format: jsonMode ? 'json' : undefined })
+                });
+                if (!response.ok) throw new Error('Ollama Error');
+                const data = await response.json();
+                return data.message.content;
+            }
+        }
+
+        // --- 4. Components ---
+
+        const SettingsModal = ({ isOpen, config, onSave, onClose }) => {
+            const [localConfig, setLocalConfig] = useState(config);
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm p-4">
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md max-h-full overflow-y-auto">
+                        <h2 className="text-xl font-bold mb-4 text-brand-900 flex items-center gap-2"><i className="fa-solid fa-sliders"></i> 設定</h2>
+                        <div className="space-y-4">
+                            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                                <h3 className="text-sm font-bold text-slate-700 mb-2">AIの役割</h3>
+                                <div className="space-y-2">
+                                    <div><label className="text-xs text-slate-500">役割名</label><input className="w-full border rounded px-2 py-1 text-sm" value={localConfig.systemRole} onChange={e => setLocalConfig({ ...localConfig, systemRole: e.target.value })} /></div>
+                                    <div><label className="text-xs text-slate-500">最終ゴール（案内先）</label><input className="w-full border rounded px-2 py-1 text-sm" value={localConfig.targetGoal} onChange={e => setLocalConfig({ ...localConfig, targetGoal: e.target.value })} /></div>
+                                </div>
+                            </div>
+                            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                                <h3 className="text-sm font-bold text-slate-700 mb-2">接続設定</h3>
+                                <div className="space-y-2">
+                                    <div><label className="text-xs text-slate-500">Provider</label><select className="w-full border rounded px-2 py-1 text-sm" value={localConfig.provider} onChange={e => setLocalConfig({ ...localConfig, provider: e.target.value })}><option value="gemini">Google Gemini</option><option value="ollama">Ollama</option></select></div>
+                                    {localConfig.provider === 'gemini' && <div><label className="text-xs text-slate-500">API Key</label><input type="password" className="w-full border rounded px-2 py-1 text-sm" value={localConfig.apiKey} onChange={e => setLocalConfig({ ...localConfig, apiKey: e.target.value })} /></div>}
+                                    <div><label className="text-xs text-slate-500">Model</label><input className="w-full border rounded px-2 py-1 text-sm" value={localConfig.model} onChange={e => setLocalConfig({ ...localConfig, model: e.target.value })} /></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="mt-4 flex justify-end gap-2">
+                            <button onClick={onClose} className="px-3 py-1.5 text-sm text-slate-500 rounded hover:bg-slate-100">キャンセル</button>
+                            <button onClick={() => onSave(localConfig)} className="px-3 py-1.5 text-sm bg-brand-600 text-white rounded hover:bg-brand-700 font-bold">保存</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const TreeNode = ({ node, level = 0, onEdit, onDelete, onAddChild, onConfirm, onRegenerate, onNodeClick, readOnly, goalLabel }) => {
+            const [isEditing, setIsEditing] = useState(false);
+            const [editTitle, setEditTitle] = useState(node.title);
+            const [isExpanded, setIsExpanded] = useState(true);
+
+            const handleSave = () => { onEdit(node.id, editTitle); setIsEditing(false); };
+
+            const isHypothesis = node.isHypothesis;
+            const isGoal = level >= 4;
+            const hasChildren = node.children && node.children.length > 0;
+
+            // UI Style Logic
+            let containerClass = isGoal ? "bg-brand-50 border-brand-500" : (isHypothesis ? "bg-amber-50 border-amber-400 border-dashed" : "bg-white border-slate-200");
+            const styleInfo = LEVEL_STYLES[Math.min(level, LEVEL_STYLES.length - 1)];
+
+            // Step Label Logic
+            let stepLabel = `Step ${level + 1}`;
+            if (isGoal) stepLabel = goalLabel; // Simply use the goal label for Step 5
+
+            return (
+                <div className="ml-1 md:ml-3 relative">
+                    {level > 0 && <div className="absolute -left-1 md:-left-3 top-3 w-1 md:w-3 h-px bg-slate-300"></div>}
+
+                    <div className={`
+                        group relative rounded shadow-sm hover:shadow-md transition-all mb-1 border pl-1 pr-1 py-1
+                        ${containerClass}
+                    `}>
+                        {/* Compact Flex Layout */}
+                        <div className="flex items-start gap-1">
+
+                            {/* Collapse Toggle */}
+                            <button
+                                onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                                className={`mt-0.5 text-slate-400 hover:text-brand-600 w-4 h-4 flex items-center justify-center transition-transform duration-200 ${!hasChildren ? 'invisible' : ''}`}
+                                style={{ transform: isExpanded ? 'rotate(0deg)' : 'rotate(-90deg)' }}
+                            >
+                                <i className="fa-solid fa-caret-down text-xs"></i>
+                            </button>
+
+                            {/* Main Content Area (Clickable) */}
+                            <div className="flex-1 min-w-0 cursor-pointer" onClick={() => !isEditing && onNodeClick(node.title)}>
+                                {/* Header: Badge & Status */}
+                                <div className="flex items-center gap-1.5 mb-0.5">
+                                    <span className={`text-[9px] px-1 rounded-sm border flex items-center gap-1 font-bold whitespace-nowrap leading-none py-0.5 ${styleInfo.color}`}>
+                                        <i className={`fa-solid ${styleInfo.icon} text-[8px]`}></i>
+                                        {stepLabel}
+                                    </span>
+                                    {isHypothesis && !isGoal && <span className="text-[9px] text-amber-600 font-bold border border-amber-200 px-1 rounded-sm bg-amber-50">仮説</span>}
+                                </div>
+
+                                {/* Body: Title & Detail */}
+                                {isEditing ? (
+                                    <div className="flex gap-1 items-center mr-1" onClick={e => e.stopPropagation()}>
+                                        <input
+                                            className="border rounded px-1 text-xs w-full focus:outline-none focus:border-brand-500"
+                                            value={editTitle} onChange={e => setEditTitle(e.target.value)}
+                                            onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) handleSave(); }}
+                                            autoFocus
+                                        />
+                                        <button onClick={handleSave} className="text-green-600"><i className="fa-solid fa-check"></i></button>
+                                    </div>
+                                ) : (
+                                    <div>
+                                        <h4 className={`font-bold text-xs leading-tight ${isGoal ? 'text-brand-900' : 'text-slate-800'}`}>
+                                            {node.title}
+                                        </h4>
+                                        {node.detail && <p className="text-[9px] text-slate-400 leading-tight line-clamp-1 mt-0.5">{node.detail}</p>}
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Right Actions (Visible on Hover/Touch) - Super Compact */}
+                            {!readOnly && (
+                                <div className="flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity ml-1 border-l pl-1 border-slate-100">
+                                    {isHypothesis && (
+                                        <>
+                                            <button onClick={(e) => { e.stopPropagation(); onConfirm(node.id) }} title="確定" className="text-brand-500 hover:text-brand-700"><i className="fa-solid fa-check-circle text-xs"></i></button>
+                                            <button onClick={(e) => { e.stopPropagation(); onRegenerate(node.id) }} title="再考" className="text-slate-400 hover:text-slate-600"><i className="fa-solid fa-rotate text-xs"></i></button>
+                                        </>
+                                    )}
+                                    <button onClick={(e) => { e.stopPropagation(); setIsEditing(!isEditing) }} title="編集" className="text-slate-400 hover:text-brand-600"><i className="fa-solid fa-pen text-xs"></i></button>
+                                    {!isGoal && <button onClick={(e) => { e.stopPropagation(); setIsExpanded(true); onAddChild(node.id); }} title="子追加" className="text-slate-400 hover:text-green-600"><i className="fa-solid fa-plus text-xs"></i></button>}
+                                    <button onClick={(e) => { e.stopPropagation(); onDelete(node.id) }} title="削除" className="text-slate-400 hover:text-red-500"><i className="fa-solid fa-trash text-xs"></i></button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {isExpanded && hasChildren && (
+                        <div className="border-l border-slate-200 pl-1 md:pl-3 ml-1 md:ml-2">
+                            {node.children.map(child => (
+                                <TreeNode
+                                    key={child.id} node={child} level={level + 1}
+                                    onEdit={onEdit} onDelete={onDelete} onAddChild={onAddChild} onConfirm={onConfirm} onRegenerate={onRegenerate}
+                                    onNodeClick={onNodeClick} readOnly={readOnly} goalLabel={goalLabel}
+                                />
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [config, setConfig] = useState(() => JSON.parse(localStorage.getItem('unknot_config')) || DEFAULT_CONFIG);
+            const [tree, setTree] = useState(() => JSON.parse(localStorage.getItem('unknot_tree')) || INITIAL_TREE);
+            const [messages, setMessages] = useState(() => JSON.parse(localStorage.getItem('unknot_messages')) || [{
+                role: 'assistant', content: `こんにちは。「unknot」へようこそ。\n私は${config.systemRole}として、あなたの困りごとを${config.targetGoal}へ繋げるお手伝いをします。`
+            }]);
+            const [status, setStatus] = useState('idle');
+            const [input, setInput] = useState('');
+            const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+            const [isMobileTreeOpen, setIsMobileTreeOpen] = useState(false);
+            const chatEndRef = useRef(null);
+            const textareaRef = useRef(null);
+
+            // Persist
+            useEffect(() => localStorage.setItem('unknot_config', JSON.stringify(config)), [config]);
+            useEffect(() => localStorage.setItem('unknot_tree', JSON.stringify(tree)), [tree]);
+            useEffect(() => localStorage.setItem('unknot_messages', JSON.stringify(messages)), [messages]);
+
+            useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+            // --- Handlers ---
+
+            const handleSend = async () => {
+                if (!input.trim() || status !== 'idle') return;
+
+                const userMsg = { role: 'user', content: input };
+                const newMessages = [...messages, userMsg];
+                setMessages(newMessages);
+                setInput('');
+                setStatus('chatting');
+
+                try {
+                    // 1. Agent A (Chat)
+                    const agentASystem = getAgentASystemPrompt(config.systemRole, config.targetGoal);
+                    const treeSummary = JSON.stringify(tree).slice(0, 1500);
+                    const chatRes = await callAiApi(config, agentASystem, [...newMessages.slice(0, -1), { role: 'user', content: `[TreeContext]: ${treeSummary}\n[User]: ${input}` }]);
+
+                    const updatedMessages = [...newMessages, { role: 'assistant', content: chatRes }];
+                    setMessages(updatedMessages);
+
+                    // 2. Agent B (Tree)
+                    setStatus('thinking');
+                    const agentBSystem = getAgentBSystemPrompt(config.systemRole, config.targetGoal);
+                    const updatePrompt = `
+Current Tree: ${JSON.stringify(tree)}
+User Input: ${input}
+AI Response: ${chatRes}
+Based on this, update the tree structure JSON.
+`;
+                    const jsonRes = await callAiApi(config, agentBSystem, [{ role: 'user', content: updatePrompt }], true);
+                    const jsonMatch = jsonRes.match(/\{[\s\S]*\}/);
+
+                    if (jsonMatch) {
+                        const newTree = JSON.parse(jsonMatch[0]);
+                        if (newTree && newTree.children) {
+                            // Goal Addition Check
+                            const prevGoals = countGoalNodes(tree);
+                            const newGoals = countGoalNodes(newTree);
+
+                            setTree(newTree);
+
+                            if (newGoals > prevGoals) {
+                                // Add notification to chat (silent system message)
+                                setTimeout(() => {
+                                    setMessages(prev => [...prev, { role: 'system', content: `✨ **案内（${config.targetGoal}）が追加されました。ツリーをご覧ください。**` }]);
+                                }, 500);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error(error);
+                    setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: ${error.message}` }]);
+                } finally {
+                    setStatus('idle');
+                }
+            };
+
+            const handleNodeClick = (title) => {
+                setInput(`『${title}』についてですが、`);
+                textareaRef.current?.focus();
+            };
+
+            // Tree Modifiers (Deep Clone Helpers)
+            const modifyNode = (id, action) => {
+                const runner = (n) => {
+                    if (n.id === id) return action(n);
+                    return { ...n, children: n.children ? n.children.map(runner).filter(Boolean) : [] };
+                };
+                setTree(runner(tree));
+            };
+            const handleEdit = (id, t) => modifyNode(id, n => ({ ...n, title: t }));
+            const handleDelete = (id) => modifyNode(id, n => id === 'root' ? n : null);
+            const handleAddChild = (id) => modifyNode(id, n => ({ ...n, children: [...(n.children || []), { id: generateUUID(), title: '新規', isHypothesis: false, children: [] }] }));
+            const handleConfirm = (id) => modifyNode(id, n => ({ ...n, isHypothesis: false }));
+            const handleRegenerate = async (id) => {
+                if (status !== 'idle') return;
+                setStatus('thinking');
+                try {
+                    // Simple partial regeneration logic (Simulated by asking Agent B for subtree)
+                    const agentBSystem = getAgentBSystemPrompt(config.systemRole, config.targetGoal);
+                    const prompt = `Re-generate subtree for Node ID "${id}" in this tree: ${JSON.stringify(tree)}`;
+                    const res = await callAiApi(config, agentBSystem, [{ role: 'user', content: prompt }], true);
+                    const match = res.match(/\{[\s\S]*\}/);
+                    if (match) modifyNode(id, () => JSON.parse(match[0]));
+                } catch (e) { alert("Error: " + e.message); }
+                finally { setStatus('idle'); }
+            };
+
+            const handleExportText = () => {
+                const loop = (n, p = '', isL = true) => {
+                    let s = `${p}${isL ? '└─' : '├─'} ${n.title}\n`;
+                    (n.children || []).forEach((c, i, a) => s += loop(c, p + (isL ? '  ' : '│ '), i === a.length - 1));
+                    return s;
+                };
+                navigator.clipboard.writeText(loop(tree).replace('└─ 困りごとの概要', '困りごとの概要'));
+                alert("Copied as Text!");
+            };
+
+            return (
+                <div className="flex h-full relative">
+                    <SettingsModal isOpen={isSettingsOpen} config={config} onSave={(c) => { setConfig(c); setIsSettingsOpen(false) }} onClose={() => setIsSettingsOpen(false)} />
+
+                    {/* Chat Area */}
+                    <div className="flex-1 flex flex-col h-full bg-white z-10 shadow-xl md:shadow-none min-w-0">
+                        <header className="h-12 border-b border-ui-border flex items-center justify-between px-4 bg-white shrink-0">
+                            <div className="flex items-center gap-2 text-brand-700 font-bold text-lg"><i className="fa-solid fa-route text-brand-500"></i> unknot</div>
+                            <div className="flex gap-1">
+                                <button onClick={() => { if (confirm('Reset?')) { setTree(INITIAL_TREE); setMessages([]); } }} className="p-2 text-slate-400 hover:text-red-500"><i className="fa-solid fa-eraser"></i></button>
+                                <button onClick={() => setIsSettingsOpen(true)} className="p-2 text-slate-400 hover:text-brand-600"><i className="fa-solid fa-sliders"></i></button>
+                                <button onClick={() => setIsMobileTreeOpen(!isMobileTreeOpen)} className="md:hidden p-2 text-brand-600"><i className="fa-solid fa-folder-tree"></i></button>
+                            </div>
+                        </header>
+
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50 text-sm">
+                            {messages.map((msg, i) => (
+                                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} ${msg.role === 'system' ? 'justify-center w-full' : ''}`}>
+                                    {msg.role === 'system' ? (
+                                        <div className="msg-fade-in text-xs bg-brand-50 text-brand-600 px-3 py-1 rounded-full border border-brand-100 flex items-center gap-2">
+                                            {msg.content.replace(/\*\*/g, '')}
+                                        </div>
+                                    ) : (
+                                        <div className={`max-w-[85%] rounded-2xl px-4 py-2 shadow-sm ${msg.role === 'user' ? 'bg-brand-600 text-white rounded-br-none' : 'bg-white text-slate-700 rounded-bl-none border border-slate-200'}`}>
+                                            <div className="markdown-body" dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }}></div>
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                            {status === 'chatting' && <div className="text-xs text-slate-400 animate-pulse ml-2">Thinking...</div>}
+                            <div ref={chatEndRef} />
+                        </div>
+
+                        <div className="p-2 bg-white border-t border-ui-border">
+                            <div className="flex gap-2 relative">
+                                <textarea
+                                    ref={textareaRef}
+                                    className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 resize-none h-12"
+                                    placeholder="入力してください..."
+                                    value={input} onChange={e => setInput(e.target.value)}
+                                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSend(); } }}
+                                    disabled={status !== 'idle'}
+                                />
+                                <button onClick={handleSend} disabled={status !== 'idle' || !input.trim()} className="absolute right-2 top-2 bottom-2 aspect-square bg-brand-600 text-white rounded hover:bg-brand-700 disabled:bg-slate-200 flex items-center justify-center">
+                                    {status === 'idle' ? <i className="fa-solid fa-paper-plane text-xs"></i> : <i className="fa-solid fa-circle-notch fa-spin text-xs"></i>}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Tree Area */}
+                    <div className={`fixed md:relative inset-y-0 right-0 w-[90%] md:w-[420px] bg-slate-50 border-l border-ui-border shadow-2xl md:shadow-none transform transition-transform duration-300 z-20 flex flex-col ${isMobileTreeOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0'}`}>
+                        <div className="h-10 border-b border-ui-border flex items-center justify-between px-3 bg-slate-100 shrink-0">
+                            <h3 className="font-bold text-slate-600 text-xs flex items-center gap-2"><i className="fa-solid fa-sitemap text-brand-500"></i> 分析ツリー</h3>
+                            <div className="flex gap-2">
+                                <button onClick={handleExportText} className="text-[10px] bg-white border px-2 py-0.5 rounded hover:bg-slate-50">Text Copy</button>
+                                <button onClick={() => navigator.clipboard.writeText(JSON.stringify(tree, null, 2))} className="text-[10px] bg-white border px-2 py-0.5 rounded hover:bg-slate-50">JSON</button>
+                                <button onClick={() => setIsMobileTreeOpen(false)} className="md:hidden"><i className="fa-solid fa-times"></i></button>
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-2 relative">
+                            {status === 'thinking' && <div className="absolute inset-0 bg-white/60 z-10 flex flex-col items-center justify-center backdrop-blur-[1px]"><i className="fa-solid fa-wand-magic-sparkles fa-bounce text-brand-500"></i></div>}
+                            <div className={status === 'thinking' ? 'blur-loading' : ''}>
+                                <TreeNode
+                                    node={tree} onEdit={handleEdit} onDelete={handleDelete} onAddChild={handleAddChild} onConfirm={handleConfirm} onRegenerate={handleRegenerate}
+                                    onNodeClick={handleNodeClick} readOnly={status !== 'idle'} goalLabel={config.targetGoal}
+                                />
+                                <div className="h-20"></div>
+                            </div>
+                        </div>
+                    </div>
+                    {isMobileTreeOpen && <div className="fixed inset-0 bg-black/20 z-10 md:hidden" onClick={() => setIsMobileTreeOpen(false)}></div>}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>
